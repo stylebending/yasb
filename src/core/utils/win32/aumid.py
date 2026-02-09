@@ -66,13 +66,25 @@ PKEY_AppUserModel_ID = PROPERTYKEY(GUID("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),
 
 class IPropertyStoreVtbl(ctypes.Structure):
     _fields_ = [
-        ("QueryInterface", WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))),
+        (
+            "QueryInterface",
+            WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(GUID), POINTER(c_void_p)),
+        ),
         ("AddRef", WINFUNCTYPE(ctypes.c_ulong, c_void_p)),
         ("Release", WINFUNCTYPE(ctypes.c_ulong, c_void_p)),
         ("GetCount", WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(ctypes.c_uint))),
-        ("GetAt", WINFUNCTYPE(ctypes.c_long, c_void_p, ctypes.c_uint, POINTER(PROPERTYKEY))),
-        ("GetValue", WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT))),
-        ("SetValue", WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT))),
+        (
+            "GetAt",
+            WINFUNCTYPE(ctypes.c_long, c_void_p, ctypes.c_uint, POINTER(PROPERTYKEY)),
+        ),
+        (
+            "GetValue",
+            WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT)),
+        ),
+        (
+            "SetValue",
+            WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT)),
+        ),
         ("Commit", WINFUNCTYPE(ctypes.c_long, c_void_p)),
     ]
 
@@ -92,7 +104,13 @@ SHGetPropertyStoreForWindow.restype = ctypes.c_long
 
 # SHGetPropertyStoreFromParsingName - to read properties from files (shortcuts)
 SHGetPropertyStoreFromParsingName = shell32.SHGetPropertyStoreFromParsingName
-SHGetPropertyStoreFromParsingName.argtypes = [wt.LPCWSTR, c_void_p, ctypes.c_uint32, POINTER(GUID), POINTER(c_void_p)]
+SHGetPropertyStoreFromParsingName.argtypes = [
+    wt.LPCWSTR,
+    c_void_p,
+    ctypes.c_uint32,
+    POINTER(GUID),
+    POINTER(c_void_p),
+]
 SHGetPropertyStoreFromParsingName.restype = ctypes.c_long
 
 # PropVariantClear is exported by Ole32.dll
@@ -236,17 +254,21 @@ def get_aumid_from_shortcut(shortcut_path: str) -> str | None:
             pass
     return aumid
 
+    return aumid
 
-def activate_app_by_aumid(aumid: str) -> bool:
+
+def activate_app_by_aumid(aumid: str, fallback_process_name: str | None = None) -> bool:
     """
     Find and activate validity window for the given AUMID.
 
     Args:
         aumid: The App User Model ID to find.
+        fallback_process_name: Optional process name (e.g. "firefox.exe") to match if AUMID fails.
 
     Returns:
         True if a window was found and activation was attempted, False otherwise.
     """
+    from core.utils.win32.window_actions import force_foreground_focus, restore_window
 
     found_hwnd = None
 
@@ -255,54 +277,45 @@ def activate_app_by_aumid(aumid: str) -> bool:
     def enum_window_callback(hwnd, _):
         nonlocal found_hwnd
         if user32.IsWindowVisible(hwnd):
+            # 1. Try exact AUMID match
             curr_aumid = get_aumid_for_window(hwnd)
             if curr_aumid == aumid:
                 found_hwnd = hwnd
                 return False  # Stop enumeration
+
+            # 2. Fallback: Try process name match if provided
+            if fallback_process_name:
+                pid = wt.DWORD(0)
+                GetWindowThreadProcessId(wt.HWND(hwnd), byref(pid))
+                if pid.value:
+                    # We need to open the process to get its image name
+                    # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    hProcess = OpenProcess(0x1000, False, pid.value)
+                    if hProcess:
+                        try:
+                            buf = ctypes.create_unicode_buffer(1024)
+                            size = wt.DWORD(1024)
+                            # QueryFullProcessImageNameW is in kernel32
+                            if hasattr(kernel32, "QueryFullProcessImageNameW"):
+                                if kernel32.QueryFullProcessImageNameW(hProcess, 0, buf, byref(size)):
+                                    full_path = buf.value
+                                    if full_path.lower().endswith(fallback_process_name.lower()):
+                                        found_hwnd = hwnd
+                                        return False
+                        finally:
+                            CloseHandle(hProcess)
+
         return True
 
     user32.EnumWindows(WNDENUMPROC(enum_window_callback), 0)
 
     if found_hwnd:
-        # 1. Restore if minimized
+        # 1. Force Focus (helps switch workspace)
+        force_foreground_focus(found_hwnd)
+
+        # 2. Restore if minimized (now that it's potentially active/on current workspace)
         if user32.IsIconic(found_hwnd):
-            # SW_RESTORE = 9
-            user32.ShowWindow(found_hwnd, 9)
-
-        # 2. Robust Focus Stealing
-        # We need to attach to BOTH the current foreground thread (to get permission to switch)
-        # AND the target thread (to effectively set focus).
-
-        fg_hwnd = user32.GetForegroundWindow()
-        # We use the existing GetWindowThreadProcessId wrapper but need a dummy PID
-        dummy_pid = wt.DWORD(0)
-        fg_tid = GetWindowThreadProcessId(wt.HWND(fg_hwnd), byref(dummy_pid))
-        target_tid = GetWindowThreadProcessId(wt.HWND(found_hwnd), byref(dummy_pid))
-        my_tid = kernel32.GetCurrentThreadId()
-
-        attached_fg = False
-        attached_target = False
-
-        try:
-            # Attach to current foreground thread
-            if fg_tid != my_tid and fg_tid:
-                attached_fg = bool(user32.AttachThreadInput(my_tid, fg_tid, True))
-
-            # Attach to target thread
-            if target_tid != my_tid and target_tid != fg_tid and target_tid:
-                attached_target = bool(user32.AttachThreadInput(my_tid, target_tid, True))
-
-            # Perform activation
-            user32.SetForegroundWindow(found_hwnd)
-            user32.SetFocus(found_hwnd)
-            user32.BringWindowToTop(found_hwnd)
-
-        finally:
-            # Detach
-            if attached_target:
-                user32.AttachThreadInput(my_tid, target_tid, False)
-            if attached_fg:
-                user32.AttachThreadInput(my_tid, fg_tid, False)
+            restore_window(found_hwnd)
 
         return True
 
